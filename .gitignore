@@ -1,0 +1,4 @@
+# Kundbackuper innehåller personuppgifter och ska aldrig checkas in
+TeamsBackup_*/
+*.log
+.DS_Store

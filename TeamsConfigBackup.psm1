@@ -473,35 +473,26 @@ function Sync-CsObjectSet {
     }
 }
 
-# Get-CsOnlinePstnUsages saknas i vissa versioner av MicrosoftTeams. Då härleds listan från
-# voice routes och voice routing policies (usages som inget refererar till kommer inte med).
-function Get-PstnUsageConfig {
-    if (Get-Command Get-CsOnlinePstnUsages -ErrorAction SilentlyContinue) {
-        return Get-CsOnlinePstnUsages -ErrorAction Stop
+# MicrosoftTeams 8.x heter cmdleten Get-/Set-CsOnlinePstnUsage, äldre versioner har pluralformen
+function Get-PstnUsageCommand([ValidateSet('Get', 'Set')][string]$Verb) {
+    foreach ($name in "$Verb-CsOnlinePstnUsage", "$Verb-CsOnlinePstnUsages") {
+        if (Get-Command $name -ErrorAction SilentlyContinue) { return $name }
     }
-    $usages = @(
-        (Get-CsOnlineVoiceRoute -ErrorAction Stop).OnlinePstnUsages
-        (Get-CsOnlineVoiceRoutingPolicy -ErrorAction Stop).OnlinePstnUsages
-    ) | Where-Object { $_ } | Sort-Object -Unique
-    Write-Log 'Get-CsOnlinePstnUsages finns inte i MicrosoftTeams-modulen – PSTN usages härleds från voice routes och voice routing policies' -Level WARN
-    [pscustomobject]@{ Identity = 'Global'; Usage = @($usages); Derived = $true }
+    throw "Varken $Verb-CsOnlinePstnUsage eller $Verb-CsOnlinePstnUsages finns i MicrosoftTeams-modulen"
 }
 
 function Sync-PstnUsages([object[]]$Backup, [string]$Phase) {
-    if (-not (Get-Command Set-CsOnlinePstnUsages -ErrorAction SilentlyContinue)) {
-        Write-Log 'Set-CsOnlinePstnUsages finns inte i MicrosoftTeams-modulen – PSTN usages återläses inte' -Level WARN
-        return
-    }
+    $setCommand = Get-PstnUsageCommand Set
     $desired = @($Backup | ForEach-Object { $_.Usage } | Where-Object { $_ })
-    $current = @((Get-CsOnlinePstnUsages -ErrorAction Stop).Usage | Where-Object { $_ })
+    $current = @((& (Get-PstnUsageCommand Get) -ErrorAction Stop).Usage | Where-Object { $_ })
     if ($Phase -eq 'Upsert') {
         foreach ($usage in ($desired | Where-Object { $_ -notin $current })) {
-            Invoke-Change -Command 'Set-CsOnlinePstnUsages' -Parameters @{ Identity = 'Global'; Usage = @{ Add = $usage } } -Reason 'Lägg till PSTN usage'
+            Invoke-Change -Command $setCommand -Parameters @{ Identity = 'Global'; Usage = @{ Add = $usage } } -Reason 'Lägg till PSTN usage'
         }
     }
     else {
         foreach ($usage in ($current | Where-Object { $_ -notin $desired })) {
-            Invoke-Change -Command 'Set-CsOnlinePstnUsages' -Parameters @{ Identity = 'Global'; Usage = @{ Remove = $usage } } -Reason 'Ta bort PSTN usage (finns inte i backup)'
+            Invoke-Change -Command $setCommand -Parameters @{ Identity = 'Global'; Usage = @{ Remove = $usage } } -Reason 'Ta bort PSTN usage (finns inte i backup)'
         }
     }
 }
@@ -747,7 +738,7 @@ function Backup-TeamsConfig {
     Write-Log "Backup av tenant '$($tenant.DisplayName)' ($($tenant.TenantId)) -> $root"
 
     # --- Direct Routing ---
-    Export-Item 'DirectRouting/PstnUsages.json' { Get-PstnUsageConfig }
+    Export-Item 'DirectRouting/PstnUsages.json' { & (Get-PstnUsageCommand Get) -ErrorAction Stop }
     foreach ($sets in $script:ObjectSets.Values) {
         foreach ($set in $sets) {
             Export-Item $set.File { & "Get-Cs$($set.Noun)" -ErrorAction Stop }

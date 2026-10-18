@@ -473,7 +473,25 @@ function Sync-CsObjectSet {
     }
 }
 
+# Get-CsOnlinePstnUsages saknas i vissa versioner av MicrosoftTeams. Då härleds listan från
+# voice routes och voice routing policies (usages som inget refererar till kommer inte med).
+function Get-PstnUsageConfig {
+    if (Get-Command Get-CsOnlinePstnUsages -ErrorAction SilentlyContinue) {
+        return Get-CsOnlinePstnUsages -ErrorAction Stop
+    }
+    $usages = @(
+        (Get-CsOnlineVoiceRoute -ErrorAction Stop).OnlinePstnUsages
+        (Get-CsOnlineVoiceRoutingPolicy -ErrorAction Stop).OnlinePstnUsages
+    ) | Where-Object { $_ } | Sort-Object -Unique
+    Write-Log 'Get-CsOnlinePstnUsages finns inte i MicrosoftTeams-modulen – PSTN usages härleds från voice routes och voice routing policies' -Level WARN
+    [pscustomobject]@{ Identity = 'Global'; Usage = @($usages); Derived = $true }
+}
+
 function Sync-PstnUsages([object[]]$Backup, [string]$Phase) {
+    if (-not (Get-Command Set-CsOnlinePstnUsages -ErrorAction SilentlyContinue)) {
+        Write-Log 'Set-CsOnlinePstnUsages finns inte i MicrosoftTeams-modulen – PSTN usages återläses inte' -Level WARN
+        return
+    }
     $desired = @($Backup | ForEach-Object { $_.Usage } | Where-Object { $_ })
     $current = @((Get-CsOnlinePstnUsages -ErrorAction Stop).Usage | Where-Object { $_ })
     if ($Phase -eq 'Upsert') {
@@ -729,7 +747,7 @@ function Backup-TeamsConfig {
     Write-Log "Backup av tenant '$($tenant.DisplayName)' ($($tenant.TenantId)) -> $root"
 
     # --- Direct Routing ---
-    Export-Item 'DirectRouting/PstnUsages.json' { Get-CsOnlinePstnUsages -ErrorAction Stop }
+    Export-Item 'DirectRouting/PstnUsages.json' { Get-PstnUsageConfig }
     foreach ($sets in $script:ObjectSets.Values) {
         foreach ($set in $sets) {
             Export-Item $set.File { & "Get-Cs$($set.Noun)" -ErrorAction Stop }

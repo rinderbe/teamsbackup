@@ -13,6 +13,7 @@ Modulen är tänkt att köras före ett ändringsarbete i en kunds Teams-miljö.
 - [Restore-TeamsConfig](#restore-teamsconfig)
 - [Torrsimning med -WhatIf](#torrsimning-med--whatif)
 - [Get-TeamsConfigBackup](#get-teamsconfigbackup)
+- [Compare-TeamsConfigBackup](#compare-teamsconfigbackup)
 - [Vad som ingår i backupen](#vad-som-ingår-i-backupen)
 - [Vad som inte ingår](#vad-som-inte-ingår)
 - [Begränsningar och saker att tänka på](#begränsningar-och-saker-att-tänka-på)
@@ -53,6 +54,7 @@ Restore-TeamsConfig -Path C:\Kund\Backup\TeamsBackup_Kund_20261018-090000
    2. Kör `Restore-TeamsConfig` utan `-WhatIf`, gärna begränsat med `-Include` eller `-User` till det som behöver återställas.
    3. Granska CSV-filen från den skarpa körningen efter rader med status `Misslyckad`.
    4. Jämför vid behov mot `BackupOnly/EffectivePolicies.csv` för att kontrollera att användarna har rätt policyer.
+6. Ta gärna en ny backup efter ändringsarbetet och jämför den med den första med `Compare-TeamsConfigBackup`. Då syns allt som har ändrats, även sådant som inte var planerat.
 
 ## Backup-TeamsConfig
 
@@ -171,6 +173,72 @@ Get-TeamsConfigBackup -Path C:\Kund\Backup\TeamsBackup_Kund_20261018-090000 | Fo
 ```
 
 Kolumnen `Restorable` visar om filen läses tillbaka automatiskt eller bara finns som referens.
+
+## Compare-TeamsConfigBackup
+
+Jämför två backuper och visar vad som skiljer. Kräver ingen anslutning till Teams, och ingenting ändras. Används till exempel för att se vad ett ändringsarbete faktiskt ändrade, eller för att ta reda på när och för vilka användare något försvann.
+
+```powershell
+Compare-TeamsConfigBackup [-ReferencePath] <backupmapp> [-DifferencePath] <backupmapp> [-Include <kategorier>] [-Exclude <kategorier>] [-User <upn>] [-PolicyType <typer>] [-Property <egenskaper>] [-CsvPath <fil>]
+```
+
+| Parameter | Beskrivning |
+|---|---|
+| `-ReferencePath` | Backupen att jämföra från, normalt den äldre. Dess värden visas i kolumnen `Before`. |
+| `-DifferencePath` | Backupen att jämföra med, normalt den nyare. Dess värden visas i kolumnen `After`. |
+| `-Include` | Kategorier att jämföra. Samma kategorier som för `Restore-TeamsConfig`, plus `BackupOnly` för filerna under `BackupOnly/`. Standard är `All`. |
+| `-Exclude` | Kategorier att hoppa över. |
+| `-User` | Begränsa till en eller flera användare eller resurskonton (UPN eller ObjectId). Om `-Include` inte anges jämförs då `PhoneNumbers`, `Users`, `UserPolicies` och användarfilerna under `BackupOnly` (`EffectivePolicies`, `UserCallingSettings`, `ResourceAccounts`). |
+| `-PolicyType` | Begränsa `Policies`, `GroupPolicyAssignments` och `UserPolicies` till vissa policytyper. |
+| `-Property` | Visa bara vissa egenskaper. Jokertecken tillåts, till exempel `LineUri`, `*VoiceRouting*` eller `CallingSettings.*`. |
+| `-CsvPath` | Spara resultatet som semikolonseparerad CSV-fil för Excel. |
+
+Resultatet är en rad per egenskap som skiljer sig:
+
+| Kolumn | Innehåll |
+|---|---|
+| `Category` | Kategorin, till exempel `Users`, `PhoneNumbers` eller `VoiceRoutes` |
+| `Type` | Objekttypen, till exempel `User`, `PhoneNumber`, `OnlineVoiceRoute` eller policytypen |
+| `Item` | Objektet: UPN för användare, numret för telefonnummer, annars objektets namn |
+| `Property` | Egenskapen som skiljer sig. Nästlade värden visas med punkt, till exempel `Policies.TeamsCallingPolicy`. |
+| `Change` | `Tillagd`, `Borttagen` eller `Ändrad` |
+| `Before`, `After` | Värdet i respektive backup |
+
+Ett objekt som bara finns i den ena backupen, till exempel en användare som har tagits bort, ger en rad utan `Property`. När `-Property` anges visas i stället en rad per vald egenskap som har ett värde. Då kommer även borttagna användare med när man letar efter försvunna nummer.
+
+### Exempel
+
+```powershell
+$fore  = 'C:\Kund\Backup\TeamsBackup_Kund_20261001-090000'
+$efter = 'C:\Kund\Backup\TeamsBackup_Kund_20261018-090000'
+
+# Alla skillnader, sparade för Excel
+Compare-TeamsConfigBackup $fore $efter -CsvPath C:\Kund\diff.csv | Format-Table
+
+# Användare som har tappat sitt telefonnummer
+Compare-TeamsConfigBackup $fore $efter -Include Users -Property LineUri |
+    Where-Object Change -eq 'Borttagen' | Format-Table Item, Before
+
+# Alla nummer som har bytt eller tappat ägare
+Compare-TeamsConfigBackup $fore $efter -Include PhoneNumbers -Property AssignedTo | Format-Table Item, Change, Before, After
+
+# Allt som har ändrats för vissa användare
+Compare-TeamsConfigBackup $fore $efter -User anna@kund.se,bertil@kund.se | Format-Table
+
+# Ändrade voice routing policies, både definitioner och tilldelningar
+Compare-TeamsConfigBackup $fore $efter -Include VoiceRoutingPolicies,UserPolicies -PolicyType OnlineVoiceRoutingPolicy | Format-Table
+
+# Bläddra och filtrera i ett fönster (Windows)
+Compare-TeamsConfigBackup $fore $efter | Out-GridView
+```
+
+### Att tänka på
+
+- Telefonnummer finns på två ställen: `LineUri` på användaren (kategori `Users`) och nummertilldelningen (kategori `PhoneNumbers`, egenskapen `AssignedTo`). Kategorin `PhoneNumbers` täcker även resurskonton.
+- En fil som bara finns i den ena backupen hoppas över med en varning. Annars skulle alla objekt i filen se tillagda eller borttagna ut. Det kan hända om backuperna togs med olika parametrar eller olika versioner av `MicrosoftTeams`-modulen.
+- Om bara den ena backupen togs med `-VoiceUsersOnly` visas användare utan Enterprise Voice som tillagda eller borttagna. Funktionen varnar för detta.
+- Tidsstämplar som ändras av sig själva (`WhenChanged`, `WhenCreated`, `LastSyncTimeStamp`) jämförs inte.
+- Sammansatta värden, till exempel listor med objekt, jämförs som helhet och visas som JSON i `Before` och `After`.
 
 ## Vad som ingår i backupen
 

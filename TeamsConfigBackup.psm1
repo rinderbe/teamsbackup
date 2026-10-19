@@ -13,9 +13,10 @@
       Backup-TeamsConfig   – läser ut konfigurationen till en tidsstämplad mapp (JSON + CSV)
       Restore-TeamsConfig  – läser tillbaka hela eller delar av en backup (stöder -WhatIf)
       Get-TeamsConfigBackup – visar innehållet i en backup
+      Compare-TeamsConfigBackup – visar skillnaderna mellan två backuper (kräver ingen anslutning)
 #>
 
-$script:ScriptVersion   = '1.0.0'
+$script:ScriptVersion   = '1.1.0'
 $script:JsonDepth       = 15
 $script:NoiseProperties = 'Element', 'XsAnyElements', 'ScopeClass', 'Anchor'
 
@@ -95,6 +96,22 @@ $script:BackupOnlyItems = [ordered]@{
     'BackupOnly/Tenant/BlockedCallingNumbers.json'      = { Get-CsTenantBlockedCallingNumbers -ErrorAction Stop }
     'BackupOnly/Tenant/DialInConferencingSettings.json' = { Get-CsOnlineDialinConferencingTenantSettings -ErrorAction Stop }
 }
+
+# Jämförelse av backuper: nyckel per fil där Identity/Name inte räcker för att para ihop objekten
+$script:CompareKeys = @{
+    'BackupOnly/ResourceAccounts.json'                  = 'ObjectId'
+    'BackupOnly/EffectivePolicies.json'                 = 'ObjectId'
+    'BackupOnly/UserCallingSettings.json'               = 'ObjectId'
+    'BackupOnly/OnlineSchedules.json'                   = 'Id'
+    'BackupOnly/Emergency/LisCivicAddresses.json'       = 'CivicAddressId'
+    'BackupOnly/Emergency/LisLocations.json'            = 'LocationId'
+    'BackupOnly/Emergency/LisSubnets.json'              = 'Subnet'
+    'BackupOnly/Emergency/LisSwitches.json'             = 'ChassisId'
+    'BackupOnly/Emergency/LisPorts.json'                = 'ChassisId', 'PortId'
+    'BackupOnly/Emergency/LisWirelessAccessPoints.json' = 'BSSID'
+}
+# Egenskaper som ändras av sig själva och inte säger något om konfigurationen
+$script:CompareIgnoreProperties = 'WhenChanged', 'WhenCreated', 'LastSyncTimeStamp'
 
 #region Hjälpfunktioner ---------------------------------------------------------------------------
 
@@ -360,6 +377,31 @@ function ConvertTo-UserRecord($User, [string[]]$PolicyProperties) {
 function Get-TargetName([string]$ObjectId) {
     if ($script:TargetNames -and $script:TargetNames.ContainsKey($ObjectId)) { return $script:TargetNames[$ObjectId] }
     return $ObjectId
+}
+
+function Get-BackupIdentities([string]$Root) {
+    foreach ($u in (Read-BackupFile $Root 'Users/Users.json' -Quiet)) { [pscustomobject]@{ ObjectId = [string]$u.ObjectId; Upn = $u.UserPrincipalName } }
+    foreach ($r in (Read-BackupFile $Root 'BackupOnly/ResourceAccounts.json' -Quiet)) { [pscustomobject]@{ ObjectId = [string]$r.ObjectId; Upn = $r.UserPrincipalName } }
+}
+
+# Översätter -User (UPN eller ObjectId) till ett uppslag på ObjectId
+function Resolve-TargetFilter([object[]]$Identities, [string[]]$User) {
+    $filter = @{}
+    foreach ($entry in $User) {
+        $match = @($Identities | Where-Object { $_.Upn -eq $entry -or $_.ObjectId -eq $entry })
+        if ($match) { foreach ($m in $match) { $filter[$m.ObjectId] = $true } }
+        elseif ($entry -as [guid]) { $filter[$entry] = $true }
+        else { Write-Log "Hittar inte '$entry' i backupen" -Level WARN }
+    }
+    if ($filter.Count -eq 0) { throw 'Ingen av de angivna användarna finns i backupen.' }
+    return $filter
+}
+
+function Format-PolicySource($Sources) {
+    @($Sources | ForEach-Object {
+        if ($_.AssignmentType -eq 'Group') { 'Group:{0} ({1}, prio {2})' -f $_.Reference, $_.PolicyName, $_.Priority }
+        else { '{0} ({1})' -f $_.AssignmentType, $_.PolicyName }
+    }) -join '; '
 }
 
 function Select-FilteredUsers([object[]]$Users) {
@@ -686,6 +728,248 @@ function Invoke-RestoreCategory([string]$Category, [string]$Phase, [string]$Path
 
 #endregion
 
+#region Jämförelse av backuper ---------------------------------------------------------------------
+
+function Format-CompareValue($Value) {
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [array] -and -not (Test-ComplexValue $Value)) { return (@($Value | Where-Object { $null -ne $_ }) -join ', ') }
+    return ConvertTo-Comparable $Value
+}
+
+# Plattar till nästlade objekt, t.ex. Policies.TeamsCallingPolicy eller CallingSettings.IsForwardingEnabled
+function Get-FlatProperties($Object, [string]$Prefix = '') {
+    $result = [ordered]@{}
+    if ($null -eq $Object) { return $result }
+    foreach ($p in $Object.PSObject.Properties) {
+        $name = $Prefix + $p.Name
+        if ($p.Value -is [System.Management.Automation.PSCustomObject]) {
+            $nested = Get-FlatProperties $p.Value "$name."
+            foreach ($k in $nested.Keys) { $result[$k] = $nested[$k] }
+        }
+        else { $result[$name] = $p.Value }
+    }
+    return $result
+}
+
+function Test-CompareProperty([string]$Name, [string[]]$Include, [string[]]$Exclude) {
+    $leaf = ($Name -split '\.')[-1]
+    if ($leaf -in $script:CompareIgnoreProperties) { return $false }
+    if ($Include -and -not ($Include | Where-Object { $Name -like $_ })) { return $false }
+    if ($Exclude | Where-Object { $Name -like $_ }) { return $false }
+    if ($script:CompareProperty -and -not ($script:CompareProperty | Where-Object { $Name -like $_ -or $leaf -like $_ })) { return $false }
+    return $true
+}
+
+function Get-CompareKey($Object, [string[]]$KeyProperty) {
+    if (-not $KeyProperty) { return Get-ObjectKey $Object }
+    $key = @(foreach ($p in $KeyProperty) { [string]$Object.$p }) -join '|'
+    if ($key.Trim('|')) { return $key }
+}
+
+function Get-CompareLabel($Object, [string]$Key) {
+    if ($Object.PSObject.Properties['UserPrincipalName'] -and $Object.UserPrincipalName) { return [string]$Object.UserPrincipalName }
+    if (($Key -as [guid]) -and $Object.PSObject.Properties['Name'] -and $Object.Name) { return [string]$Object.Name }
+    return $Key
+}
+
+function New-DiffRecord($Category, $Type, $Item, $Property, $Change, $Before, $After) {
+    [pscustomobject][ordered]@{
+        Category = $Category
+        Type     = $Type
+        Item     = $Item
+        Property = $Property
+        Change   = $Change
+        Before   = $Before
+        After    = $After
+    }
+}
+
+# Parar ihop objekten i två backuper och returnerar en rad per egenskap som skiljer sig.
+# Objekt som bara finns i ena backupen ger en rad (Tillagd/Borttagen), eller en rad per ifylld
+# egenskap när urvalet är begränsat till vissa egenskaper.
+function Compare-RecordSet {
+    param(
+        [string]$Category,
+        [string]$Type,
+        [AllowEmptyCollection()][object[]]$Reference,
+        [AllowEmptyCollection()][object[]]$Difference,
+        [string[]]$KeyProperty,
+        [scriptblock]$Label,
+        [string[]]$Include,
+        [string[]]$Exclude
+    )
+    $refMap, $difMap = foreach ($side in $Reference, $Difference) {
+        $map = @{}
+        $items = @($side | Where-Object { $null -ne $_ })
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            $key = Get-CompareKey $items[$i] $KeyProperty
+            if (-not $key) { $key = if ($items.Count -eq 1) { $Type } else { "#$i" } }
+            $map[$key] = $items[$i]
+        }
+        $map
+    }
+    $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in @($refMap.Keys) + @($difMap.Keys)) { $null = $keys.Add($k) }
+
+    $entries = foreach ($key in $keys) {
+        $obj = $difMap[$key] ?? $refMap[$key]
+        [pscustomobject]@{ Key = $key; Label = ($Label ? (& $Label $obj) : (Get-CompareLabel $obj $key)) }
+    }
+    $propertyLimited = $Include -or $script:CompareProperty
+
+    foreach ($entry in ($entries | Sort-Object Label)) {
+        $ref = $refMap[$entry.Key]
+        $dif = $difMap[$entry.Key]
+        $refProps = Get-FlatProperties $ref
+        $difProps = Get-FlatProperties $dif
+        $names = @(@($refProps.Keys) + @($difProps.Keys) | Select-Object -Unique |
+            Where-Object { Test-CompareProperty $_ $Include $Exclude })
+
+        if ($null -eq $ref -or $null -eq $dif) {
+            $change = if ($null -eq $ref) { 'Tillagd' } else { 'Borttagen' }
+            if (-not $propertyLimited) {
+                New-DiffRecord $Category $Type $entry.Label '' $change '' ''
+                continue
+            }
+            $props = if ($null -eq $ref) { $difProps } else { $refProps }
+            foreach ($name in $names) {
+                $value = Format-CompareValue $props[$name]
+                if ($value -eq '') { continue }
+                if ($null -eq $ref) { New-DiffRecord $Category $Type $entry.Label $name $change '' $value }
+                else { New-DiffRecord $Category $Type $entry.Label $name $change $value '' }
+            }
+            continue
+        }
+
+        foreach ($name in $names) {
+            if ((ConvertTo-Comparable $refProps[$name]) -eq (ConvertTo-Comparable $difProps[$name])) { continue }
+            $before = Format-CompareValue $refProps[$name]
+            $after  = Format-CompareValue $difProps[$name]
+            $change = if ($before -eq '') { 'Tillagd' } elseif ($after -eq '') { 'Borttagen' } else { 'Ändrad' }
+            New-DiffRecord $Category $Type $entry.Label $name $change $before $after
+        }
+    }
+}
+
+# Läser samma fil ur båda backuperna. Saknas filen i den ena hoppas den över, annars skulle
+# alla objekt i den felaktigt visas som tillagda eller borttagna.
+function Read-BackupPair([string]$RelativePath) {
+    $ref = Read-BackupFile $script:CompareRoots[0] $RelativePath -Quiet
+    $dif = Read-BackupFile $script:CompareRoots[1] $RelativePath -Quiet
+    if ($null -eq $ref -and $null -eq $dif) { return $null }
+    if ($null -eq $ref -or $null -eq $dif) {
+        Write-Log ('{0} finns bara i den {1} backupen – hoppar över' -f $RelativePath, ($null -eq $ref ? 'andra' : 'första')) -Level WARN
+        return $null
+    }
+    return [pscustomobject]@{ Reference = $ref; Difference = $dif }
+}
+
+function ConvertTo-EffectivePolicyRecord($Entry) {
+    $policies = [ordered]@{}
+    foreach ($p in @($Entry.Policies)) {
+        if (-not $p -or -not $p.PolicyType) { continue }
+        $policies[$p.PolicyType] = '{0} via {1}' -f ($p.PolicyName ?? '<ingen>'), (Format-PolicySource $p.PolicySource)
+    }
+    [pscustomobject]@{ ObjectId = $Entry.ObjectId; UserPrincipalName = $Entry.UserPrincipalName; Policies = [pscustomobject]$policies }
+}
+
+function Invoke-CompareCategory([string]$Category, [string[]]$PolicyType) {
+    switch ($Category) {
+        'PstnUsages' {
+            # Listan har inga egenskaper att filtrera på
+            if ($script:CompareProperty) { return }
+            $pair = Read-BackupPair 'DirectRouting/PstnUsages.json'
+            if (-not $pair) { return }
+            $before = @($pair.Reference | ForEach-Object { $_.Usage } | Where-Object { $_ })
+            $after  = @($pair.Difference | ForEach-Object { $_.Usage } | Where-Object { $_ })
+            foreach ($u in ($before | Where-Object { $_ -notin $after })) { New-DiffRecord $Category 'PstnUsage' $u '' 'Borttagen' '' '' }
+            foreach ($u in ($after | Where-Object { $_ -notin $before })) { New-DiffRecord $Category 'PstnUsage' $u '' 'Tillagd' '' '' }
+        }
+        { $_ -in $script:ObjectSets.Keys } {
+            foreach ($set in $script:ObjectSets[$Category]) {
+                $pair = Read-BackupPair $set.File
+                if ($pair) { Compare-RecordSet -Category $Category -Type $set.Noun -Reference $pair.Reference -Difference $pair.Difference }
+            }
+        }
+        'Policies' {
+            $types = @(foreach ($root in $script:CompareRoots) {
+                Get-ChildItem -Path (Join-Path $root 'Policies') -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object BaseName
+            }) | Sort-Object -Unique
+            foreach ($type in $types) {
+                if ($PolicyType -and $type -notin $PolicyType) { continue }
+                $pair = Read-BackupPair "Policies/$type.json"
+                if ($pair) { Compare-RecordSet -Category $Category -Type $type -Reference $pair.Reference -Difference $pair.Difference }
+            }
+        }
+        'GroupPolicyAssignments' {
+            $pair = Read-BackupPair 'Assignments/GroupPolicyAssignments.json'
+            if (-not $pair) { return }
+            $inScope = { -not $PolicyType -or $_.PolicyType -in $PolicyType }
+            Compare-RecordSet -Category $Category -Type 'GroupPolicyAssignment' -KeyProperty GroupId, PolicyType `
+                -Reference @($pair.Reference | Where-Object $inScope) -Difference @($pair.Difference | Where-Object $inScope) `
+                -Label { param($a) '{0} ({1})' -f $a.GroupId, $a.PolicyType }
+        }
+        'PhoneNumbers' {
+            $pair = Read-BackupPair 'Assignments/PhoneNumberAssignments.json'
+            if (-not $pair) { return }
+            # Med -User tas nummer med som satt på någon av användarna i någon av backuperna
+            $numbers = $null
+            if ($script:TargetFilter) {
+                $numbers = @{}
+                foreach ($n in @($pair.Reference) + @($pair.Difference)) {
+                    if ($n -and $script:TargetFilter.ContainsKey([string]$n.AssignedPstnTargetId)) { $numbers[$n.TelephoneNumber] = $true }
+                }
+            }
+            $ref, $dif = foreach ($side in $pair.Reference, $pair.Difference) {
+                , @($side | Where-Object { $_ -and (-not $numbers -or $numbers.ContainsKey($_.TelephoneNumber)) } |
+                    Select-Object @{ Name = 'AssignedTo'; Expression = { if ($_.AssignedPstnTargetId) { Get-TargetName ([string]$_.AssignedPstnTargetId) } } }, *)
+            }
+            Compare-RecordSet -Category $Category -Type 'PhoneNumber' -KeyProperty TelephoneNumber -Exclude AssignedPstnTargetId `
+                -Reference $ref -Difference $dif -Label { param($n) $n.TelephoneNumber }
+        }
+        'Users' {
+            $pair = Read-BackupPair 'Users/Users.json'
+            if ($pair) {
+                Compare-RecordSet -Category $Category -Type 'User' -KeyProperty ObjectId -Exclude 'Policies.*' `
+                    -Reference (Select-FilteredUsers $pair.Reference) -Difference (Select-FilteredUsers $pair.Difference)
+            }
+        }
+        'UserPolicies' {
+            $pair = Read-BackupPair 'Users/Users.json'
+            if ($pair) {
+                $include = if ($PolicyType) { @($PolicyType | ForEach-Object { "Policies.$_" }) } else { 'Policies.*' }
+                Compare-RecordSet -Category $Category -Type 'User' -KeyProperty ObjectId -Include $include `
+                    -Reference (Select-FilteredUsers $pair.Reference) -Difference (Select-FilteredUsers $pair.Difference)
+            }
+        }
+        'BackupOnly' {
+            $files = @(foreach ($root in $script:CompareRoots) {
+                $dir = Join-Path $root 'BackupOnly'
+                Get-ChildItem -Path $dir -Filter '*.json' -Recurse -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { 'BackupOnly/' + [System.IO.Path]::GetRelativePath($dir, $_.FullName).Replace('\', '/') }
+            }) | Sort-Object -Unique
+            foreach ($file in $files) {
+                $keyProperty = $script:CompareKeys[$file]
+                # Med -User jämförs bara filer som har en rad per användare eller resurskonto
+                if ($script:TargetFilter -and $keyProperty -notcontains 'ObjectId') { continue }
+                $pair = Read-BackupPair $file
+                if (-not $pair) { continue }
+                $ref = @(Select-FilteredUsers $pair.Reference)
+                $dif = @(Select-FilteredUsers $pair.Difference)
+                if ($file -eq 'BackupOnly/EffectivePolicies.json') {
+                    $ref = @($ref | ForEach-Object { ConvertTo-EffectivePolicyRecord $_ })
+                    $dif = @($dif | ForEach-Object { ConvertTo-EffectivePolicyRecord $_ })
+                }
+                Compare-RecordSet -Category $Category -Type ([System.IO.Path]::GetFileNameWithoutExtension($file)) `
+                    -KeyProperty $keyProperty -Reference $ref -Difference $dif
+            }
+        }
+    }
+}
+
+#endregion
+
 #region Publika funktioner -----------------------------------------------------------------------
 
 function Backup-TeamsConfig {
@@ -809,10 +1093,7 @@ function Backup-TeamsConfig {
                             UserPrincipalName = $e.UserPrincipalName
                             PolicyType        = $p.PolicyType
                             PolicyName        = $p.PolicyName
-                            Source            = (@($p.PolicySource | ForEach-Object {
-                                if ($_.AssignmentType -eq 'Group') { 'Group:{0} ({1}, prio {2})' -f $_.Reference, $_.PolicyName, $_.Priority }
-                                else { '{0} ({1})' -f $_.AssignmentType, $_.PolicyName }
-                            }) -join '; ')
+                            Source            = Format-PolicySource $p.PolicySource
                         }
                     }
                 }
@@ -945,22 +1226,10 @@ function Restore-TeamsConfig {
 
     # Namnuppslag för loggning och -User-filter
     $script:TargetNames = @{}
-    $identities = @(
-        foreach ($u in (Read-BackupFile $Path 'Users/Users.json' -Quiet)) { [pscustomobject]@{ ObjectId = [string]$u.ObjectId; Upn = $u.UserPrincipalName } }
-        foreach ($r in (Read-BackupFile $Path 'BackupOnly/ResourceAccounts.json' -Quiet)) { [pscustomobject]@{ ObjectId = [string]$r.ObjectId; Upn = $r.UserPrincipalName } }
-    )
+    $identities = @(Get-BackupIdentities $Path)
     foreach ($id in $identities) { if ($id.ObjectId) { $script:TargetNames[$id.ObjectId] = $id.Upn } }
 
-    if ($User) {
-        $script:TargetFilter = @{}
-        foreach ($entry in $User) {
-            $match = @($identities | Where-Object { $_.Upn -eq $entry -or $_.ObjectId -eq $entry })
-            if ($match) { foreach ($m in $match) { $script:TargetFilter[$m.ObjectId] = $true } }
-            elseif ($entry -as [guid]) { $script:TargetFilter[$entry] = $true }
-            else { Write-Log "Hittar inte '$entry' i backupen" -Level WARN }
-        }
-        if ($script:TargetFilter.Count -eq 0) { throw 'Ingen av de angivna användarna finns i backupen.' }
-    }
+    if ($User) { $script:TargetFilter = Resolve-TargetFilter $identities $User }
 
     Write-Log ('Återläsning från backup {0} ({1}) tagen {2}' -f $manifest.TenantName, $manifest.TenantId, $manifest.BackupDate)
     Write-Log ('Kategorier: {0}' -f ($categories -join ', '))
@@ -1043,6 +1312,112 @@ function Get-TeamsConfigBackup {
     }
 }
 
+function Compare-TeamsConfigBackup {
+    <#
+    .SYNOPSIS
+        Visar skillnaderna mellan två backuper. Kräver ingen anslutning till Teams.
+    .DESCRIPTION
+        Returnerar en rad per egenskap som skiljer sig, med kolumnerna Category, Type, Item, Property,
+        Change (Tillagd, Borttagen, Ändrad), Before (värdet i ReferencePath) och After (värdet i DifferencePath).
+    .PARAMETER ReferencePath
+        Backupen att jämföra från, normalt den äldre.
+    .PARAMETER DifferencePath
+        Backupen att jämföra med, normalt den nyare.
+    .PARAMETER Include
+        Kategorier att jämföra. Samma kategorier som Restore-TeamsConfig, plus BackupOnly. Standard 'All'.
+    .PARAMETER Exclude
+        Kategorier att hoppa över.
+    .PARAMETER User
+        Begränsa till en eller flera användare/resurskonton (UPN eller ObjectId).
+        Utan -Include jämförs då PhoneNumbers, Users, UserPolicies och användarfilerna under BackupOnly.
+    .PARAMETER PolicyType
+        Begränsa Policies, GroupPolicyAssignments och UserPolicies till vissa policytyper.
+    .PARAMETER Property
+        Visa bara dessa egenskaper. Jokertecken tillåts, t.ex. LineUri, *VoiceRouting*, Policies.*.
+    .PARAMETER CsvPath
+        Spara resultatet som semikolonseparerad CSV-fil.
+    .EXAMPLE
+        Compare-TeamsConfigBackup .\TeamsBackup_Kund_20261001-090000 .\TeamsBackup_Kund_20261018-090000 | Format-Table
+    .EXAMPLE
+        Compare-TeamsConfigBackup $gammal $ny -Include Users -Property LineUri | Where-Object Change -eq 'Borttagen'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$ReferencePath,
+        [Parameter(Mandatory, Position = 1)][string]$DifferencePath,
+        [ValidateSet('All', 'PstnUsages', 'TranslationRules', 'Gateways', 'VoiceRoutes', 'VoiceRoutingPolicies', 'DialPlans',
+            'Policies', 'NetworkConfig', 'NumberBlocking', 'GroupPolicyAssignments', 'PhoneNumbers', 'Users', 'UserPolicies', 'BackupOnly')]
+        [string[]]$Include = @('All'),
+        [ValidateSet('PstnUsages', 'TranslationRules', 'Gateways', 'VoiceRoutes', 'VoiceRoutingPolicies', 'DialPlans',
+            'Policies', 'NetworkConfig', 'NumberBlocking', 'GroupPolicyAssignments', 'PhoneNumbers', 'Users', 'UserPolicies', 'BackupOnly')]
+        [string[]]$Exclude,
+        [string[]]$User,
+        [string[]]$PolicyType,
+        [string[]]$Property,
+        [string]$CsvPath
+    )
+
+    $roots = @($ReferencePath, $DifferencePath | ForEach-Object { (Resolve-Path $_).Path })
+    $refManifest, $difManifest = foreach ($root in $roots) {
+        $file = Join-Path $root 'manifest.json'
+        if (-not (Test-Path $file)) { throw "Hittar ingen manifest.json i '$root' – är det en backupmapp?" }
+        Get-Content $file -Raw | ConvertFrom-Json
+    }
+
+    Write-Host ('Före:  {0} {1}  ({2})' -f $refManifest.TenantName, $refManifest.BackupDate, $roots[0])
+    Write-Host ('Efter: {0} {1}  ({2})' -f $difManifest.TenantName, $difManifest.BackupDate, $roots[1])
+    if ($refManifest.TenantId -ne $difManifest.TenantId) {
+        Write-Log "Backuperna kommer från olika tenants ($($refManifest.TenantId) och $($difManifest.TenantId))" -Level WARN
+    }
+    if ([datetime]$refManifest.BackupDate -gt [datetime]$difManifest.BackupDate) {
+        Write-Log 'Den första backupen är nyare än den andra – Before och After är omvända i tid' -Level WARN
+    }
+    if ([bool]$refManifest.VoiceUsersOnly -ne [bool]$difManifest.VoiceUsersOnly) {
+        Write-Log 'Bara den ena backupen togs med -VoiceUsersOnly – användare utan Enterprise Voice visas som tillagda eller borttagna' -Level WARN
+    }
+
+    $allCategories = $script:RestoreOrder + 'BackupOnly'
+    $categories = if ($Include -contains 'All') {
+        if ($User) { $script:UserCategories + 'BackupOnly' } else { $allCategories }
+    }
+    else { $allCategories | Where-Object { $_ -in $Include } }
+    $categories = @($categories | Where-Object { $_ -notin $Exclude })
+
+    $script:CompareRoots    = $roots
+    $script:CompareProperty = $Property
+    $script:TargetFilter    = $null
+    $script:TargetNames     = @{}
+    $identities = @(foreach ($root in $roots) { Get-BackupIdentities $root })
+    foreach ($id in $identities) { if ($id.ObjectId) { $script:TargetNames[$id.ObjectId] = $id.Upn } }
+
+    try {
+        if ($User) { $script:TargetFilter = Resolve-TargetFilter $identities $User }
+
+        $results = [System.Collections.Generic.List[object]]::new()
+        foreach ($category in $categories) {
+            try { foreach ($r in @(Invoke-CompareCategory -Category $category -PolicyType $PolicyType)) { $results.Add($r) } }
+            catch { Write-Log "Jämförelsen av $category avbröts – $($_.Exception.Message)" -Level ERROR }
+        }
+    }
+    finally {
+        $script:CompareRoots = $null
+        $script:CompareProperty = $null
+        $script:TargetFilter = $null
+        $script:TargetNames = $null
+    }
+
+    if ($results.Count -eq 0) {
+        Write-Host 'Inga skillnader.'
+        return
+    }
+    Write-Host ('{0} skillnader: {1}' -f $results.Count, (($results | Group-Object Category | ForEach-Object { '{0} {1}' -f $_.Name, $_.Count }) -join ', '))
+    if ($CsvPath) {
+        $results | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding utf8 -Delimiter ';'
+        Write-Host "Sparad: $CsvPath"
+    }
+    $results
+}
+
 #endregion
 
-Export-ModuleMember -Function Backup-TeamsConfig, Restore-TeamsConfig, Get-TeamsConfigBackup
+Export-ModuleMember -Function Backup-TeamsConfig, Restore-TeamsConfig, Get-TeamsConfigBackup, Compare-TeamsConfigBackup

@@ -14,6 +14,7 @@ Modulen är tänkt att köras före ett ändringsarbete i en kunds Teams-miljö.
 - [Torrsimning med -WhatIf](#torrsimning-med--whatif)
 - [Get-TeamsConfigBackup](#get-teamsconfigbackup)
 - [Compare-TeamsConfigBackup](#compare-teamsconfigbackup)
+- [Get-TeamsCallForwarding](#get-teamscallforwarding)
 - [Vad som ingår i backupen](#vad-som-ingår-i-backupen)
 - [Vad som inte ingår](#vad-som-inte-ingår)
 - [Begränsningar och saker att tänka på](#begränsningar-och-saker-att-tänka-på)
@@ -239,6 +240,45 @@ Compare-TeamsConfigBackup $fore $efter | Out-GridView
 - Om bara den ena backupen togs med `-VoiceUsersOnly` visas användare utan Enterprise Voice som tillagda eller borttagna. Funktionen varnar för detta.
 - Tidsstämplar som ändras av sig själva (`WhenChanged`, `WhenCreated`, `LastSyncTimeStamp`) jämförs inte.
 - Sammansatta värden, till exempel listor med objekt, jämförs som helhet och visas som JSON i `Before` och `After`.
+
+## Get-TeamsCallForwarding
+
+Listar de användare som har vidarekoppling aktiverad, och inget annat. Ändrar ingenting. Används till exempel vid felsökning av samtal som loopar eller hamnar fel.
+
+```powershell
+Get-TeamsCallForwarding [-Path <backupmapp>] [-User <upn>] [-CsvPath <fil>]
+```
+
+| Parameter | Beskrivning |
+|---|---|
+| `-Path` | Läs från en backup i stället för från tenanten. Backupen måste vara tagen med `-IncludeUserCallingSettings`. Kräver ingen anslutning. |
+| `-User` | Begränsa till en eller flera användare (UPN). |
+| `-CsvPath` | Spara resultatet som semikolonseparerad CSV-fil för Excel. |
+
+Utan `-Path` läses inställningarna direkt från tenanten för alla användare med Enterprise Voice. Det tar ungefär 1 sekund per användare.
+
+Resultatet är en rad per aktiv vidarekoppling:
+
+| Kolumn | Innehåll |
+|---|---|
+| `UserPrincipalName` | Användaren |
+| `Type` | `Direkt` (alla samtal vidarekopplas), `Samtidig ringning` eller `Vid ej svar` |
+| `TargetType` | `SingleTarget`, `MyDelegates`, `Group` eller `Voicemail` |
+| `Target` | Numret eller SIP-adressen, alternativt delegaterna eller samtalsgruppens medlemmar |
+| `Delay` | Fördröjning innan vidarekoppling vid ej svar |
+
+Vidarekoppling vid ej svar till röstbrevlådan är standard för de flesta användare och visas inte.
+
+```powershell
+# Alla aktiva vidarekopplingar i tenanten, sparade för Excel
+Get-TeamsCallForwarding -CsvPath C:\Kund\vidarekoppling.csv | Format-Table
+
+# Vidarekopplingar som riktar sig mot ett visst nummer
+Get-TeamsCallForwarding | Where-Object Target -like '*46812345678*'
+
+# Hur det såg ut vid en tidigare backup
+Get-TeamsCallForwarding -Path C:\Kund\Backup\TeamsBackup_Kund_20261018-090000 | Format-Table
+```
 
 ## Vad som ingår i backupen
 

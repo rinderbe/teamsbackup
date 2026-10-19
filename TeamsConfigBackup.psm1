@@ -14,6 +14,7 @@
       Restore-TeamsConfig  – läser tillbaka hela eller delar av en backup (stöder -WhatIf)
       Get-TeamsConfigBackup – visar innehållet i en backup
       Compare-TeamsConfigBackup – visar skillnaderna mellan två backuper (kräver ingen anslutning)
+      Get-TeamsCallForwarding – listar användare med aktiv vidarekoppling
 #>
 
 $script:ScriptVersion   = '1.1.0'
@@ -970,6 +971,42 @@ function Invoke-CompareCategory([string]$Category, [string[]]$PolicyType) {
 
 #endregion
 
+#region Vidarekoppling ----------------------------------------------------------------------------
+
+function Format-ForwardingTarget([string]$TargetType, [string]$Target, $Settings) {
+    switch ($TargetType) {
+        'Voicemail'   { 'Röstbrevlåda' }
+        'MyDelegates' { 'Delegater: ' + (@($Settings.Delegates | ForEach-Object { $_.Id }) -join ', ') }
+        'Group'       { 'Samtalsgrupp: ' + (@($Settings.CallGroupTargets) -join ', ') }
+        default       { $Target }
+    }
+}
+
+# En rad per aktiv vidarekoppling. Ej svar till röstbrevlåda är standard och tas inte med.
+function ConvertTo-ForwardingRecords([string]$Upn, $Settings) {
+    if (-not $Settings) { return }
+    if ($Settings.IsForwardingEnabled) {
+        [pscustomobject]@{
+            UserPrincipalName = $Upn
+            Type              = [string]$Settings.ForwardingType -eq 'Simultaneous' ? 'Samtidig ringning' : 'Direkt'
+            TargetType        = [string]$Settings.ForwardingTargetType
+            Target            = Format-ForwardingTarget ([string]$Settings.ForwardingTargetType) $Settings.ForwardingTarget $Settings
+            Delay             = $null
+        }
+    }
+    if ($Settings.IsUnansweredEnabled -and [string]$Settings.UnansweredTargetType -ne 'Voicemail') {
+        [pscustomobject]@{
+            UserPrincipalName = $Upn
+            Type              = 'Vid ej svar'
+            TargetType        = [string]$Settings.UnansweredTargetType
+            Target            = Format-ForwardingTarget ([string]$Settings.UnansweredTargetType) $Settings.UnansweredTarget $Settings
+            Delay             = [string]$Settings.UnansweredDelay
+        }
+    }
+}
+
+#endregion
+
 #region Publika funktioner -----------------------------------------------------------------------
 
 function Backup-TeamsConfig {
@@ -1418,6 +1455,64 @@ function Compare-TeamsConfigBackup {
     $results
 }
 
+function Get-TeamsCallForwarding {
+    <#
+    .SYNOPSIS
+        Listar användare som har vidarekoppling aktiverad. Ändrar ingenting.
+    .DESCRIPTION
+        Returnerar en rad per aktiv vidarekoppling med kolumnerna UserPrincipalName, Type (Direkt,
+        Samtidig ringning, Vid ej svar), TargetType, Target och Delay. Vidarekoppling vid ej svar till
+        röstbrevlådan är standard och visas inte.
+        Utan -Path läses inställningarna från tenanten (ca 1 s per röstanvändare). Med -Path läses de
+        från en backup tagen med -IncludeUserCallingSettings, och ingen anslutning krävs.
+    .PARAMETER Path
+        Backupmapp att läsa från i stället för tenanten.
+    .PARAMETER User
+        Begränsa till en eller flera användare (UPN).
+    .PARAMETER CsvPath
+        Spara resultatet som semikolonseparerad CSV-fil.
+    .EXAMPLE
+        Get-TeamsCallForwarding -CsvPath C:\Kund\vidarekoppling.csv | Format-Table
+    .EXAMPLE
+        Get-TeamsCallForwarding -Path .\TeamsBackup_Kund_20261018-090000 | Format-Table
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Path,
+        [string[]]$User,
+        [string]$CsvPath
+    )
+
+    if ($Path) {
+        $entries = Read-BackupFile (Resolve-Path $Path).Path 'BackupOnly/UserCallingSettings.json' -Quiet
+        if ($null -eq $entries) { throw "Backupen saknar BackupOnly/UserCallingSettings.json – den togs utan -IncludeUserCallingSettings." }
+        if ($User) { $entries = @($entries | Where-Object UserPrincipalName -in $User) }
+        $results = @(foreach ($e in $entries) { ConvertTo-ForwardingRecords $e.UserPrincipalName $e.CallingSettings })
+    }
+    else {
+        $null = Assert-TeamsConnection
+        $upns = if ($User) { $User }
+                else { @(Get-CsOnlineUser -Filter 'EnterpriseVoiceEnabled -eq $true' -ErrorAction Stop | ForEach-Object UserPrincipalName) }
+        $i = 0
+        $results = @(foreach ($upn in $upns) {
+            $i++
+            Write-Progress -Activity 'Läser vidarekopplingar' -Status $upn -PercentComplete ($i * 100 / $upns.Count)
+            try { ConvertTo-ForwardingRecords $upn (Get-CsUserCallingSettings -Identity $upn -ErrorAction Stop) }
+            catch { Write-Log "Samtalsinställningar för ${upn}: $($_.Exception.Message)" -Level WARN }
+        })
+        Write-Progress -Activity 'Läser vidarekopplingar' -Completed
+    }
+
+    $userCount = @($results | Select-Object -ExpandProperty UserPrincipalName -Unique).Count
+    Write-Host ('{0} användare med aktiv vidarekoppling' -f $userCount)
+    if ($results.Count -eq 0) { return }
+    if ($CsvPath) {
+        $results | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding utf8 -Delimiter ';'
+        Write-Host "Sparad: $CsvPath"
+    }
+    $results
+}
+
 #endregion
 
-Export-ModuleMember -Function Backup-TeamsConfig, Restore-TeamsConfig, Get-TeamsConfigBackup, Compare-TeamsConfigBackup
+Export-ModuleMember -Function Backup-TeamsConfig, Restore-TeamsConfig, Get-TeamsConfigBackup, Compare-TeamsConfigBackup, Get-TeamsCallForwarding
